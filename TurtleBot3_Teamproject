@@ -1,0 +1,575 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan, Imu
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from tf_transformations import euler_from_quaternion
+import math
+import numpy as np
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+import time
+import os
+import subprocess
+
+class ZigzagExplorationNode(Node):
+    # =================================================================
+    # == 상태 정의 (원점 복귀 관련 상태 추가)
+    # =================================================================
+    STATE_ALIGN_WALL = 1
+    STATE_FORWARD = 2
+    STATE_TURN_1 = 3
+    STATE_MOVE_SHORT = 4
+    STATE_REVERSE_SHORT = 5
+    STATE_TURN_2 = 6
+    STATE_STOP = 7 # 이 상태는 이제 사용되지 않음
+    STATE_ALIGN_BACK_WALL = 8
+    STATE_ADJUST_BACK_DISTANCE = 10
+    STATE_SAVE_MAP = 11                 # <<< [추가] 지도 저장을 위한 임시 상태
+    STATE_RETURN_TO_ORIGIN = 12         # <<< [추가] 원점 복귀 주행 상태
+    STATE_FINAL_ALIGN = 13              # <<< [추가] 원점 도착 후 최종 방향 정렬 상태
+    STATE_SHUTDOWN = 14                 # <<< [추가] 모든 것을 종료하는 최종 상태
+
+    def __init__(self):
+        super().__init__('zigzag_exploration_node')
+
+        # QoS, 퍼블리셔, 서브스크라이버 등 (이전과 동일)
+        scan_qos = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT, durability=QoSDurabilityPolicy.VOLATILE)
+        imu_qos = QoSProfile(depth=10)
+        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.subscription_scan = self.create_subscription(LaserScan, 'scan', self.scan_callback, scan_qos)
+        self.subscription_imu = self.create_subscription(Imu, 'imu', self.imu_callback, imu_qos)
+        self.odom_subscriber = self.create_subscription(Odometry, 'odom', self.odom_callback, 10)
+        
+        # 변수 초기화
+        self.current_scan = None
+        self.current_imu_orientation = None
+        self.current_yaw_rad = 0.0
+        self.current_x = 0.0
+        self.current_y = 0.0
+
+        # =================================================================
+        # == [수정] 원점(시작 지점) 저장을 위한 변수 추가
+        # =================================================================
+        self.origin_x = None
+        self.origin_y = None
+        self.origin_yaw = None
+        self.origin_set = False
+
+        # 센서 데이터 수신 대기
+        self.get_logger().info("센서 데이터 수신 대기 중...")
+        while self.current_scan is None or self.current_imu_orientation is None or self.current_x == 0.0:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self.current_scan is not None and self.current_imu_orientation is not None and self.current_x != 0.0:
+                self.get_logger().info("LiDAR, IMU, Odometry 데이터 수신 확인 완료.")
+                break
+            time.sleep(0.5)
+            
+        # 초기 상태 설정
+        orientation_q = self.current_imu_orientation
+        _, _, self.current_yaw_rad = euler_from_quaternion(
+            [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        )
+        self.initial_yaw_for_straight = self.current_yaw_rad
+        self.state = self.STATE_FORWARD
+        self.get_logger().info(f"초기 측면 정렬 생략. Yaw({self.initial_yaw_for_straight:.2f}) 기준으로 전진 시작.")
+
+        # 메인 타이머
+        self.timer = self.create_timer(0.1, self.timer_callback)
+
+        # 파라미터들
+        self.map_save_name = "my_home_map" # 저장될 지도 이름
+        # ... (이전 코드의 모든 파라미터들 복사) ...
+        self.forward_distance_threshold = 0.3
+        self.parallel_consistency_ratio = 0.99
+        self.pid_kp = 0.8
+        self.pid_kp_align = 13
+        self.pid_kp_align_back = 10
+        self.align_wall_required_parallel_pairs = 6
+        self.align_wall_alignment_time = 2.0
+        self.align_wall_aligned_start_time = None
+        self.align_wall_start_time = None
+        self.wall_selection_timeout = 5.0
+        self.align_wall_timeout = 5.0
+        self.max_initial_wall_distance = 0.4
+        self.LEFT_FRONT_ALIGN_ANGLE_RANGE = (55, 65)
+        self.LEFT_BACK_ALIGN_ANGLE_RANGE = (115, 125)
+        self.RIGHT_FRONT_ALIGN_ANGLE_RANGE = (295, 305)
+        self.RIGHT_BACK_ALIGN_ANGLE_RANGE = (235, 245)
+        self.ALIGN_WALL_TOTAL_CHECK_PAIRS = 11
+        self.LEFT_WALL_ALIGN_ANGLES_PAIRS = []
+        for offset_deg in np.linspace(25.0, 35.0, self.ALIGN_WALL_TOTAL_CHECK_PAIRS, endpoint=True):
+            self.LEFT_WALL_ALIGN_ANGLES_PAIRS.append((90.0 - offset_deg, 90.0 + offset_deg))
+        self.RIGHT_WALL_ALIGN_ANGLES_PAIRS = []
+        for offset_deg in np.linspace(25.0, 35.0, self.ALIGN_WALL_TOTAL_CHECK_PAIRS, endpoint=True):
+            self.RIGHT_WALL_ALIGN_ANGLES_PAIRS.append((270.0 - offset_deg, 270.0 + offset_deg))
+        self.back_wall_required_parallel_pairs = 6
+        self.back_wall_alignment_time = 3.0
+        self.back_wall_align_timeout = 10.0
+        self.back_wall_aligned_start_time = None
+        self.back_align_start_time = None
+        self.BACK_WALL_LEFT_ALIGN_ANGLE_RANGE = (155, 165)
+        self.BACK_WALL_RIGHT_ALIGN_ANGLE_RANGE = (195, 205)
+        self.BACK_WALL_ALIGN_ANGLES_PAIRS = []
+        left_angles_for_check = range(155, 166)
+        for left_angle_deg in left_angles_for_check:
+            self.BACK_WALL_ALIGN_ANGLES_PAIRS.append((left_angle_deg, 180.0 + (180.0 - left_angle_deg)))
+        self.back_distance_target = 0.20
+        self.back_distance_error_threshold = 0.02
+        self.adjust_back_distance_speed = 0.05
+        self.adjust_back_distance_start_time = None
+        self.adjust_back_distance_timeout = 5.0
+        self.turn_angular_speed = 0.5
+        self.initial_turn_yaw = 0.0
+        self.yaw_error_threshold = math.radians(3.0)
+        self.short_move_distance = 0.6
+        self.short_move_linear_speed = 0.20
+        self.initial_short_move_pose = None
+        self.short_move_front_obstacle_threshold = 0.3
+        self.reverse_distance_target = 0.25
+        self.reverse_linear_speed = -0.1
+        self.initial_reverse_pose = None
+        self.reverse_start_time = None
+        self.reverse_timeout = 3.0
+        self.turn1_post_turn_front_distance_check_threshold = 0.20
+        self.is_turning_right_currently = True
+        self.stop_exploration_flag = False
+        self.no_wall_detected_start_time = None
+        self.no_wall_for_stop_distance = 0.4
+        self.no_wall_duration_for_continue_exploration = 1.0
+        
+        # 원점 복귀 관련 파라미터
+        self.return_linear_speed = 0.15
+        self.return_angular_speed = 0.4
+        self.distance_threshold_at_origin = 0.15 # 원점에 도착했다고 판단할 거리 임계값
+
+        self._reset_forward_state_flags("프로그램 시작")
+        self.get_logger().info('Zigzag Exploration Node has been started.')
+
+    # =================================================================
+    # == [수정] 지도 저장 함수 (종료 로직 분리)
+    # =================================================================
+    def save_map(self):
+        """map_saver_cli를 호출하여 지도를 저장하는 함수"""
+        self.get_logger().info('Saving map via map_saver_cli...')
+        map_save_path = os.path.join(os.path.expanduser('~'), self.map_save_name)
+        command = [
+            'ros2', 'run', 'nav2_map_server', 'map_saver_cli',
+            '-f', map_save_path,
+            '--ros-args', '-p', 'map_subscribe_transient_local:=true'
+        ]
+        self.get_logger().info(f"Executing command: {' '.join(command)}")
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=15)
+            self.get_logger().info(f"map_saver_cli stdout: {result.stdout}")
+            self.get_logger().info(f"Map saved successfully to {map_save_path}.yaml/.pgm")
+            return True
+        except Exception as e:
+            self.get_logger().error(f"Failed to save map: {e}")
+            return False
+
+    # =================================================================
+    # == [추가] 최종 종료 함수
+    # =================================================================
+    def shutdown_node(self):
+        """로봇을 정지시키고 노드를 완전히 종료하는 함수"""
+        if self.timer is not None:
+            self.timer.cancel()
+        self.get_logger().info("All tasks finished. Shutting down the node.")
+        self.publisher_.publish(Twist()) # 로봇 정지
+        self.destroy_node()
+        rclpy.shutdown()
+
+    # 콜백 및 헬퍼 함수들 (이전과 동일)
+    def scan_callback(self, msg):
+        self.current_scan = msg
+
+    def imu_callback(self, msg):
+        self.current_imu_orientation = msg.orientation
+
+    def odom_callback(self, msg):
+        self.current_x = msg.pose.pose.position.x
+        self.current_y = msg.pose.pose.position.y
+        # =================================================================
+        # == [수정] 최초의 위치를 원점으로 저장
+        # =================================================================
+        if not self.origin_set:
+            self.origin_x = self.current_x
+            self.origin_y = self.current_y
+            # IMU 데이터가 있어야만 초기 yaw 설정 가능
+            if self.current_imu_orientation:
+                _, _, self.origin_yaw = euler_from_quaternion([
+                    self.current_imu_orientation.x, self.current_imu_orientation.y,
+                    self.current_imu_orientation.z, self.current_imu_orientation.w
+                ])
+                self.origin_set = True
+                self.get_logger().info(f"Origin set to: x={self.origin_x:.2f}, y={self.origin_y:.2f}, yaw={math.degrees(self.origin_yaw):.2f}")
+
+    # ... (get_valid_ranges_in_deg_range, get_median_distance_in_range 등 이전과 동일한 함수들) ...
+    def get_valid_ranges_in_deg_range(self, scan_msg, min_angle_deg, max_angle_deg):
+        if scan_msg is None: return []
+        valid_ranges = []
+        for i, r in enumerate(scan_msg.ranges):
+            if math.isinf(r) or math.isnan(r) or r == 0.0: continue
+            angle_deg = np.degrees(scan_msg.angle_min + i * scan_msg.angle_increment)
+            if angle_deg < 0: angle_deg += 360
+            if min_angle_deg > max_angle_deg:
+                if angle_deg >= min_angle_deg or angle_deg <= max_angle_deg: valid_ranges.append(r)
+            elif min_angle_deg <= angle_deg <= max_angle_deg:
+                valid_ranges.append(r)
+        return valid_ranges
+
+    def get_median_distance_in_range(self, scan_msg, min_angle_deg, max_angle_deg):
+        ranges = self.get_valid_ranges_in_deg_range(scan_msg, min_angle_deg, max_angle_deg)
+        return np.median(ranges) if ranges else float('inf')
+
+    def get_distance_at_specific_angle(self, scan_msg, target_angle_deg):
+        if scan_msg is None or not scan_msg.ranges: return float('inf')
+        angle_min_rad, angle_increment_rad = scan_msg.angle_min, scan_msg.angle_increment
+        target_angle_rad = math.radians(target_angle_deg)
+        index = int(round((target_angle_rad - angle_min_rad) / angle_increment_rad))
+        if 0 <= index < len(scan_msg.ranges):
+            r = scan_msg.ranges[index]
+            if not (math.isinf(r) or math.isnan(r) or r == 0.0): return r
+        return float('inf')
+
+    def is_wall_parallel_robust(self, scan_msg, angle_pairs, parallel_consistency_ratio):
+        if scan_msg is None: return 0
+        num_parallel_pairs = 0
+        for angle_a_deg, angle_b_deg in angle_pairs:
+            dist_a = self.get_distance_at_specific_angle(scan_msg, angle_a_deg)
+            dist_b = self.get_distance_at_specific_angle(scan_msg, angle_b_deg)
+            if math.isinf(dist_a) or math.isinf(dist_b): continue
+            if max(dist_a, dist_b) > 0 and min(dist_a, dist_b) / max(dist_a, dist_b) >= parallel_consistency_ratio:
+                num_parallel_pairs += 1
+        return num_parallel_pairs
+        
+    def destroy_node(self):
+        self.get_logger().info('Node destruction sequence initiated. Stopping the robot.')
+        self.publisher_.publish(Twist())
+        super().destroy_node()
+
+    def _reset_forward_state_flags(self, reason_msg=""):
+        self.stop_exploration_flag = True
+        self.no_wall_detected_start_time = None
+        self.get_logger().info(f"STATE_FORWARD 진입 ({reason_msg}): 플래그 초기화 완료.")
+
+    # =================================================================
+    # == 메인 타이머 콜백 (원점 복귀 로직 추가)
+    # =================================================================
+    def timer_callback(self):
+        if not rclpy.ok():
+            return
+            
+        twist = Twist()
+        current_time = self.get_clock().now().nanoseconds / 1e9
+
+        if self.current_scan is None or self.current_imu_orientation is None or not self.origin_set:
+            self.get_logger().warn("센서 데이터 또는 원점 정보 수신 불가. 대기 중...")
+            self.publisher_.publish(twist)
+            return
+
+        orientation_q = self.current_imu_orientation
+        _, _, self.current_yaw_rad = euler_from_quaternion(
+            [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        )
+        
+        # 탐색 로직 (이전과 거의 동일, 종료 조건만 변경)
+        # ... (ALIGN_WALL, FORWARD, ... ALIGN_BACK_WALL 상태 로직) ...
+        # 종료 조건: STATE_TURN_1에서 탐색할 공간이 없다고 판단되면 STATE_SAVE_MAP으로 변경
+        if self.state == self.STATE_TURN_1:
+            if self.stop_exploration_flag:
+                self.get_logger().info("TURN_1: 더 이상 탐색할 공간이 없어 지도 저장을 시작합니다.")
+                self.state = self.STATE_SAVE_MAP # <<< [수정] 종료 상태 변경
+                self.publisher_.publish(Twist())
+                return
+            # ... (기존 STATE_TURN_1 로직) ...
+            turn_rad = -math.pi/2.0 if self.is_turning_right_currently else math.pi/2.0
+            target_yaw = self.initial_turn_yaw + turn_rad
+            target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
+            yaw_error = target_yaw - self.current_yaw_rad
+            yaw_error = math.atan2(math.sin(yaw_error), math.cos(yaw_error))
+            if abs(yaw_error) < self.yaw_error_threshold:
+                self.publisher_.publish(Twist())
+                front_dist = self.get_median_distance_in_range(self.current_scan, 350, 10)
+                if front_dist < self.turn1_post_turn_front_distance_check_threshold:
+                    self.state = self.STATE_REVERSE_SHORT
+                    self.reverse_start_time = current_time
+                else:
+                    self.state = self.STATE_MOVE_SHORT
+                    self.initial_short_move_pose = (self.current_x, self.current_y)
+                return
+            twist.angular.z = np.sign(yaw_error) * self.turn_angular_speed
+            self.publisher_.publish(twist)
+            return
+
+        # ... (다른 모든 탐색 상태 로직: ALIGN_WALL, FORWARD, ...) ...
+        if self.state == self.STATE_ALIGN_WALL:
+            if self.align_wall_start_time is None: self.align_wall_start_time = current_time
+            if (current_time - self.align_wall_start_time) > self.align_wall_timeout:
+                self.get_logger().warn(f"ALIGN_WALL: {self.align_wall_timeout}초 경과. 정렬을 중단하고 강제로 전진합니다.")
+                self.state = self.STATE_FORWARD
+                self.initial_yaw_for_straight = self.current_yaw_rad
+                self._reset_forward_state_flags("측면 정렬 타임아웃")
+                self.publisher_.publish(Twist())
+                return
+            left_dist_overall = self.get_median_distance_in_range(self.current_scan, 70, 110)
+            right_dist_overall = self.get_median_distance_in_range(self.current_scan, 250, 290)
+            is_left_valid = not math.isinf(left_dist_overall) and left_dist_overall < self.max_initial_wall_distance
+            is_right_valid = not math.isinf(right_dist_overall) and right_dist_overall < self.max_initial_wall_distance
+            if not is_left_valid and not is_right_valid:
+                self.get_logger().info("ALIGN_WALL: 주변에서 벽 탐색 중...")
+                self.publisher_.publish(Twist())
+                return
+            align_left_now = left_dist_overall <= right_dist_overall if is_left_valid and is_right_valid else is_left_valid
+            if align_left_now:
+                front_range, back_range, pairs = self.LEFT_FRONT_ALIGN_ANGLE_RANGE, self.LEFT_BACK_ALIGN_ANGLE_RANGE, self.LEFT_WALL_ALIGN_ANGLES_PAIRS
+            else:
+                front_range, back_range, pairs = self.RIGHT_FRONT_ALIGN_ANGLE_RANGE, self.RIGHT_BACK_ALIGN_ANGLE_RANGE, self.RIGHT_WALL_ALIGN_ANGLES_PAIRS
+            front_dist, back_dist = self.get_median_distance_in_range(self.current_scan, *front_range), self.get_median_distance_in_range(self.current_scan, *back_range)
+            if math.isinf(front_dist) or math.isinf(back_dist):
+                self.publisher_.publish(Twist())
+                return
+            error = front_dist - back_dist
+            correction = self.pid_kp_align * error
+            if not align_left_now: correction *= -1.0
+            twist.angular.z = np.clip(correction, -0.5, 0.5)
+            self.publisher_.publish(twist)
+            num_parallel = self.is_wall_parallel_robust(self.current_scan, pairs, self.parallel_consistency_ratio)
+            if num_parallel >= self.align_wall_required_parallel_pairs:
+                if self.align_wall_aligned_start_time is None: self.align_wall_aligned_start_time = current_time
+                if (current_time - self.align_wall_aligned_start_time) >= self.align_wall_alignment_time:
+                    self.get_logger().info(f"ALIGN_WALL: {'왼쪽' if align_left_now else '오른쪽'} 벽 정렬 완료. STATE_FORWARD로 전환.")
+                    self.state = self.STATE_FORWARD
+                    self.initial_yaw_for_straight = self.current_yaw_rad
+                    self._reset_forward_state_flags("측면 정렬 성공")
+                    self.publisher_.publish(Twist())
+            else:
+                self.align_wall_aligned_start_time = None
+            return
+        elif self.state == self.STATE_FORWARD:
+            if self.initial_yaw_for_straight is None:
+                self.get_logger().error("STATE_FORWARD: 기준 Yaw 없음. 종료합니다.")
+                self.state = self.STATE_SHUTDOWN
+                return
+            yaw_error = self.initial_yaw_for_straight - self.current_yaw_rad
+            yaw_error = math.atan2(math.sin(yaw_error), math.cos(yaw_error))
+            twist.angular.z = np.clip(self.pid_kp * yaw_error, -0.3, 0.3)
+            next_turn_side_distance = float('inf')
+            if self.is_turning_right_currently:
+                check_angle_range = (260, 280)
+            else:
+                check_angle_range = (80, 100)
+            next_turn_side_distance = self.get_median_distance_in_range(self.current_scan, *check_angle_range)
+            if next_turn_side_distance > self.no_wall_for_stop_distance:
+                if self.no_wall_detected_start_time is None:
+                    self.no_wall_detected_start_time = current_time
+                    self.get_logger().info(f"FORWARD: 다음 회전 방향에 벽 없음. 타이머 시작.")
+                elif (current_time - self.no_wall_detected_start_time) > self.no_wall_duration_for_continue_exploration:
+                    if self.stop_exploration_flag:
+                        self.stop_exploration_flag = False
+                        self.get_logger().info(f"FORWARD: 계속 탐색할 공간 발견. 탐색 계속.")
+            else:
+                self.no_wall_detected_start_time = None
+            front_distance = self.get_median_distance_in_range(self.current_scan, 350, 10)
+            if front_distance < self.forward_distance_threshold:
+                self.get_logger().info(f"FORWARD: 전방 장애물 감지. 턴 시작.")
+                self.state = self.STATE_TURN_1
+                self.initial_turn_yaw = self.current_yaw_rad
+                self.publisher_.publish(Twist())
+                return
+            twist.linear.x = 0.2
+            self.publisher_.publish(twist)
+            return
+        elif self.state == self.STATE_REVERSE_SHORT:
+            if self.reverse_start_time is None: self.reverse_start_time = current_time
+            if (current_time - self.reverse_start_time) > self.reverse_timeout:
+                self.get_logger().warn("REVERSE: 타임아웃. 강제 전환.")
+                self.state = self.STATE_MOVE_SHORT
+                self.initial_short_move_pose = (self.current_x, self.current_y)
+                self.publisher_.publish(Twist())
+                return
+            front_dist = self.get_median_distance_in_range(self.current_scan, 350, 10)
+            if front_dist >= self.reverse_distance_target:
+                self.state = self.STATE_MOVE_SHORT
+                self.initial_short_move_pose = (self.current_x, self.current_y)
+                self.publisher_.publish(Twist())
+                return
+            twist.linear.x = self.reverse_linear_speed
+            self.publisher_.publish(twist)
+            return
+        elif self.state == self.STATE_MOVE_SHORT:
+            if self.initial_short_move_pose is None:
+                self.state = self.STATE_TURN_2
+                self.initial_turn_yaw = self.current_yaw_rad
+                return
+            dist_moved = math.hypot(self.current_x - self.initial_short_move_pose[0], self.current_y - self.initial_short_move_pose[1])
+            if dist_moved >= self.short_move_distance:
+                self.state = self.STATE_TURN_2
+                self.initial_turn_yaw = self.current_yaw_rad
+                self.publisher_.publish(Twist())
+                return
+            front_dist = self.get_median_distance_in_range(self.current_scan, 345, 15)
+            if front_dist < self.short_move_front_obstacle_threshold:
+                self.state = self.STATE_TURN_2
+                self.initial_turn_yaw = self.current_yaw_rad
+                self.publisher_.publish(Twist())
+                return
+            twist.linear.x = self.short_move_linear_speed
+            self.publisher_.publish(twist)
+            return
+        elif self.state == self.STATE_TURN_2:
+            turn_rad = -math.pi/2.0 if self.is_turning_right_currently else math.pi/2.0
+            target_yaw = self.initial_turn_yaw + turn_rad
+            target_yaw = math.atan2(math.sin(target_yaw), math.cos(target_yaw))
+            yaw_error = target_yaw - self.current_yaw_rad
+            yaw_error = math.atan2(math.sin(yaw_error), math.cos(yaw_error))
+            if abs(yaw_error) < self.yaw_error_threshold:
+                self.get_logger().info("TURN_2: 완료. 뒷벽과의 거리 조정을 시작합니다.")
+                self.state = self.STATE_ADJUST_BACK_DISTANCE
+                self.adjust_back_distance_start_time = None
+                self.publisher_.publish(Twist())
+                return
+            twist.angular.z = np.sign(yaw_error) * self.turn_angular_speed
+            self.publisher_.publish(twist)
+            return
+        elif self.state == self.STATE_ADJUST_BACK_DISTANCE:
+            if self.adjust_back_distance_start_time is None:
+                self.adjust_back_distance_start_time = current_time
+            if (current_time - self.adjust_back_distance_start_time) > self.adjust_back_distance_timeout:
+                self.get_logger().warn("ADJUST_BACK_DISTANCE: 타임아웃. 뒷면 정렬로 강제 전환.")
+                self.state = self.STATE_ALIGN_BACK_WALL
+                self.back_align_start_time = None
+                self.publisher_.publish(Twist())
+                return
+            current_back_distance = self.get_median_distance_in_range(self.current_scan, 175, 185)
+            if math.isinf(current_back_distance):
+                self.get_logger().warn("ADJUST_BACK_DISTANCE: 뒷벽 감지 불가. 뒷면 정렬로 강제 전환.")
+                self.state = self.STATE_ALIGN_BACK_WALL
+                self.back_align_start_time = None
+                self.publisher_.publish(Twist())
+                return
+            error = self.back_distance_target - current_back_distance
+            if abs(error) < self.back_distance_error_threshold:
+                self.get_logger().info("ADJUST_BACK_DISTANCE: 목표 거리 도달. 뒷면 정렬 시작.")
+                self.state = self.STATE_ALIGN_BACK_WALL
+                self.back_align_start_time = None
+                self.publisher_.publish(Twist())
+                return
+            speed = self.pid_kp * error
+            twist.linear.x = np.clip(speed, -self.adjust_back_distance_speed, self.adjust_back_distance_speed)
+            self.publisher_.publish(twist)
+            return
+        elif self.state == self.STATE_ALIGN_BACK_WALL:
+            if self.back_align_start_time is None: self.back_align_start_time = current_time
+            def handle_align_failure_or_skip(reason):
+                self.get_logger().warn(f"ALIGN_BACK_WALL: {reason}. 뒷면 정렬 실패. 측면 정렬로 바로 넘어갑니다.")
+                self.state = self.STATE_ALIGN_WALL
+                self.is_turning_right_currently = not self.is_turning_right_currently
+                self.align_wall_start_time = None
+                self.align_wall_aligned_start_time = None
+                self.publisher_.publish(Twist())
+                return
+            if (current_time - self.back_align_start_time) > self.back_wall_align_timeout:
+                handle_align_failure_or_skip("타임아웃")
+                return
+            dist_left = self.get_median_distance_in_range(self.current_scan, *self.BACK_WALL_LEFT_ALIGN_ANGLE_RANGE)
+            dist_right = self.get_median_distance_in_range(self.current_scan, *self.BACK_WALL_RIGHT_ALIGN_ANGLE_RANGE)
+            if math.isinf(dist_left) or math.isinf(dist_right):
+                handle_align_failure_or_skip("센서 감지 실패")
+                return
+            error = dist_left - dist_right
+            twist.angular.z = np.clip(self.pid_kp_align_back * error, -0.4, 0.4)
+            self.publisher_.publish(twist)
+            num_parallel = self.is_wall_parallel_robust(self.current_scan, self.BACK_WALL_ALIGN_ANGLES_PAIRS, self.parallel_consistency_ratio)
+            if num_parallel >= self.back_wall_required_parallel_pairs:
+                if self.back_wall_aligned_start_time is None:
+                    self.back_wall_aligned_start_time = current_time
+                if (current_time - self.back_wall_aligned_start_time) >= self.back_wall_alignment_time:
+                    self.get_logger().info("ALIGN_BACK_WALL: 뒷면 정렬 성공. 다음 경로를 위한 측면 정렬 시작.")
+                    self.state = self.STATE_ALIGN_WALL
+                    self.is_turning_right_currently = not self.is_turning_right_currently
+                    self.align_wall_start_time = None
+                    self.align_wall_aligned_start_time = None
+                    self.publisher_.publish(Twist())
+                    return
+            else:
+                self.back_wall_aligned_start_time = None
+            return
+
+        # =================================================================
+        # == [추가] 새로운 상태들의 로직
+        # =================================================================
+        elif self.state == self.STATE_SAVE_MAP:
+            self.publisher_.publish(Twist()) # 일단 정지
+            if self.save_map():
+                self.get_logger().info("지도 저장 완료. 원점 복귀를 시작합니다.")
+                self.state = self.STATE_RETURN_TO_ORIGIN
+            else:
+                self.get_logger().error("지도 저장 실패. 프로그램을 종료합니다.")
+                self.state = self.STATE_SHUTDOWN
+            return
+
+        elif self.state == self.STATE_RETURN_TO_ORIGIN:
+            # 1. 원점까지의 거리 계산
+            distance_to_origin = math.hypot(self.origin_x - self.current_x, self.origin_y - self.current_y)
+
+            # 2. 원점 도착 시 최종 방향 정렬 상태로 전환
+            if distance_to_origin < self.distance_threshold_at_origin:
+                self.get_logger().info("원점 도착. 최종 방향 정렬을 시작합니다.")
+                self.state = self.STATE_FINAL_ALIGN
+                self.publisher_.publish(Twist())
+                return
+
+            # 3. 원점을 향한 각도 계산
+            angle_to_origin = math.atan2(self.origin_y - self.current_y, self.origin_x - self.current_x)
+            yaw_error = angle_to_origin - self.current_yaw_rad
+            yaw_error = math.atan2(math.sin(yaw_error), math.cos(yaw_error)) # -pi ~ pi 범위로 정규화
+
+            # 4. 원점을 향해 회전 및 직진
+            # 아직 원점을 바라보고 있지 않다면 회전부터
+            if abs(yaw_error) > self.yaw_error_threshold:
+                twist.linear.x = 0.0
+                twist.angular.z = np.sign(yaw_error) * self.return_angular_speed
+            # 원점을 바라보고 있다면 직진
+            else:
+                twist.linear.x = self.return_linear_speed
+                twist.angular.z = 0.0
+            
+            self.publisher_.publish(twist)
+            return
+
+        elif self.state == self.STATE_FINAL_ALIGN:
+            # 시작했을 때의 방향으로 정렬
+            yaw_error = self.origin_yaw - self.current_yaw_rad
+            yaw_error = math.atan2(math.sin(yaw_error), math.cos(yaw_error))
+
+            # 정렬이 완료되면 종료 상태로 전환
+            if abs(yaw_error) < self.yaw_error_threshold:
+                self.get_logger().info("원점 복귀 및 최종 정렬 완료. 모든 작업을 종료합니다.")
+                self.state = self.STATE_SHUTDOWN
+                self.publisher_.publish(Twist())
+                return
+            
+            twist.angular.z = np.sign(yaw_error) * self.return_angular_speed
+            self.publisher_.publish(twist)
+            return
+
+        elif self.state == self.STATE_SHUTDOWN:
+            self.shutdown_node()
+            return
+
+def main(args=None):
+    rclpy.init(args=args)
+    zigzag_node = ZigzagExplorationNode()
+    try:
+        rclpy.spin(zigzag_node)
+    except KeyboardInterrupt:
+        zigzag_node.get_logger().info('Keyboard Interrupt received. Shutting down.')
+    finally:
+        # spin 루프가 어떤 이유로든 종료될 때 노드가 아직 살아있다면 확실히 종료
+        if rclpy.ok() and zigzag_node.context.ok():
+            zigzag_node.destroy_node()
+            rclpy.try_shutdown()
+
+if __name__ == '__main__':
+    main()
